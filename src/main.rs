@@ -7,7 +7,8 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::{
     ffi::CStr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{mpsc, Arc, atomic::{AtomicUsize, Ordering}},
+    thread,
     time::{Duration, Instant},
 };
 use winit::{
@@ -51,6 +52,8 @@ struct Texture {
     dims: (u32, u32),
 }
 
+const MAX_FRAMES_IN_FLIGHT: usize = 2;
+
 struct VkCtx {
     _entry: Entry,
     instance: Instance,
@@ -65,8 +68,6 @@ struct VkCtx {
     sc_views: Vec<vk::ImageView>,
     sc_format: vk::Format,
     extent: vk::Extent2D,
-    render_pass: vk::RenderPass,
-    framebuffers: Vec<vk::Framebuffer>,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     cmd_pool: vk::CommandPool,
@@ -74,15 +75,17 @@ struct VkCtx {
     descriptor_pool: vk::DescriptorPool,
     descriptor_layout: vk::DescriptorSetLayout,
     descriptor_sets: Vec<vk::DescriptorSet>,
-    image_available: vk::Semaphore,
-    render_done: vk::Semaphore,
-    fence: vk::Fence,
+    image_available: [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
+    render_done: [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
+    fences: [vk::Fence; MAX_FRAMES_IN_FLIGHT],
+    current_frame: usize,
     cache: std::collections::HashMap<PathBuf, Texture>,
     cache_order: std::collections::VecDeque<PathBuf>,
     max_cache_size: usize,
     tex_sampler: vk::Sampler,
     staging_buf: vk::Buffer,
     staging_mem: vk::DeviceMemory,
+    staging_capacity: u64,
 }
 
 fn cstr(s: &[u8]) -> &CStr {
@@ -125,7 +128,7 @@ impl VkCtx {
             None,
         )?;
         let req = device.get_buffer_memory_requirements(buf);
-        let mem = device.allocate_memory(
+        let mem_result = device.allocate_memory(
             &vk::MemoryAllocateInfo::default()
                 .allocation_size(req.size)
                 .memory_type_index(Self::find_memory_type(
@@ -135,9 +138,18 @@ impl VkCtx {
                     props,
                 )?),
             None,
-        )?;
-        device.bind_buffer_memory(buf, mem, 0)?;
-        Ok((buf, mem))
+        );
+
+        match mem_result {
+            Ok(mem) => {
+                device.bind_buffer_memory(buf, mem, 0)?;
+                Ok((buf, mem))
+            }
+            Err(e) => {
+                device.destroy_buffer(buf, None);
+                Err(e.into())
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -216,7 +228,7 @@ impl VkCtx {
         let exts = ash_window::enumerate_required_extensions(display)?;
         let inst = entry.create_instance(
             &vk::InstanceCreateInfo::default()
-                .application_info(&vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_0))
+                .application_info(&vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3))
                 .enabled_extension_names(exts),
             None,
         )?;
@@ -248,9 +260,12 @@ impl VkCtx {
                     })
             })
             .context("No GPU")?;
+        let mut dynamic_rendering_feature =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
         let device = inst.create_device(
             pdev,
             &vk::DeviceCreateInfo::default()
+                .push_next(&mut dynamic_rendering_feature)
                 .queue_create_infos(&[vk::DeviceQueueCreateInfo::default()
                     .queue_family_index(qfam)
                     .queue_priorities(&[1.0])])
@@ -268,8 +283,6 @@ impl VkCtx {
             window.inner_size().width,
             window.inner_size().height,
         )?;
-        let render_pass = Self::create_render_pass(&device, sc_format)?;
-        let framebuffers = Self::create_framebuffers(&device, render_pass, &sc_views, extent)?;
         let descriptor_layout = device.create_descriptor_set_layout(
             &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
                 vk::DescriptorSetLayoutBinding::default()
@@ -290,7 +303,7 @@ impl VkCtx {
                 }]),
             None,
         )?;
-        let pipeline = Self::create_pipeline(&device, render_pass, pipeline_layout, extent)?;
+        let pipeline = Self::create_pipeline(&device, sc_format, pipeline_layout, extent)?;
         let cmd_pool = device.create_command_pool(
             &vk::CommandPoolCreateInfo::default()
                 .queue_family_index(qfam)
@@ -317,12 +330,18 @@ impl VkCtx {
                 .descriptor_pool(descriptor_pool)
                 .set_layouts(&vec![descriptor_layout; sc_images.len()]),
         )?;
-        let image_available = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
-        let render_done = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
-        let fence = device.create_fence(
-            &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-            None,
-        )?;
+        let mut image_available = [vk::Semaphore::null(); MAX_FRAMES_IN_FLIGHT];
+        let mut render_done = [vk::Semaphore::null(); MAX_FRAMES_IN_FLIGHT];
+        let mut fences = [vk::Fence::null(); MAX_FRAMES_IN_FLIGHT];
+        for i in 0..MAX_FRAMES_IN_FLIGHT {
+            image_available[i] = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+            render_done[i] = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+            fences[i] = device.create_fence(
+                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                None,
+            )?;
+        }
+
         let tex_sampler = device.create_sampler(
             &vk::SamplerCreateInfo::default()
                 .mag_filter(vk::Filter::LINEAR)
@@ -332,14 +351,37 @@ impl VkCtx {
                 .mipmap_mode(vk::SamplerMipmapMode::LINEAR),
             None,
         )?;
-        let (staging_buf, staging_mem) = Self::create_buffer(
+        let (staging_buf, staging_mem) = match Self::create_buffer(
             &inst,
             &device,
             pdev,
             4,
             vk::BufferUsageFlags::TRANSFER_SRC,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                for i in 0..MAX_FRAMES_IN_FLIGHT {
+                    device.destroy_semaphore(image_available[i], None);
+                    device.destroy_semaphore(render_done[i], None);
+                    device.destroy_fence(fences[i], None);
+                }
+                device.destroy_sampler(tex_sampler, None);
+                device.destroy_descriptor_pool(descriptor_pool, None);
+                device.destroy_command_pool(cmd_pool, None);
+                device.destroy_pipeline(pipeline, None);
+                device.destroy_pipeline_layout(pipeline_layout, None);
+                device.destroy_descriptor_set_layout(descriptor_layout, None);
+                for &v in &sc_views {
+                    device.destroy_image_view(v, None);
+                }
+                swapchain_loader.destroy_swapchain(swapchain, None);
+                device.destroy_device(None);
+                surface_loader.destroy_surface(surface, None);
+                inst.destroy_instance(None);
+                return Err(e);
+            }
+        };
         Ok(Self {
             _entry: entry,
             instance: inst,
@@ -354,8 +396,6 @@ impl VkCtx {
             sc_views,
             sc_format,
             extent,
-            render_pass,
-            framebuffers,
             pipeline_layout,
             pipeline,
             cmd_pool,
@@ -365,13 +405,15 @@ impl VkCtx {
             descriptor_sets,
             image_available,
             render_done,
-            fence,
+            fences,
+            current_frame: 0,
             cache: std::collections::HashMap::new(),
             cache_order: std::collections::VecDeque::new(),
             max_cache_size: 10,
             tex_sampler,
             staging_buf,
             staging_mem,
+            staging_capacity: 4,
         })
     }
 
@@ -397,7 +439,7 @@ impl VkCtx {
             .iter()
             .find(|f| f.format == vk::Format::B8G8R8A8_SRGB)
             .context("B8G8R8A8_SRGB format not found")
-            .or_else(|_| formats.get(0).context("No surface formats found"))?;
+            .or_else(|_| formats.first().context("No surface formats found"))?;
         let extent = if caps.current_extent.width != u32::MAX {
             caps.current_extent
         } else {
@@ -450,63 +492,9 @@ impl VkCtx {
         Ok((swapchain, sc_images, sc_views, surf_fmt.format, extent))
     }
 
-    unsafe fn create_render_pass(device: &Device, format: vk::Format) -> Result<vk::RenderPass> {
-        let attachment = vk::AttachmentDescription::default()
-            .format(format)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
-        let subpass = vk::SubpassDescription::default()
-            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(&[vk::AttachmentReference {
-                attachment: 0,
-                layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            }]);
-        let dep = vk::SubpassDependency::default()
-            .src_subpass(vk::SUBPASS_EXTERNAL)
-            .dst_subpass(0)
-            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
-        Ok(device.create_render_pass(
-            &vk::RenderPassCreateInfo::default()
-                .attachments(&[attachment])
-                .subpasses(&[subpass])
-                .dependencies(&[dep]),
-            None,
-        )?)
-    }
-
-    unsafe fn create_framebuffers(
-        device: &Device,
-        render_pass: vk::RenderPass,
-        views: &[vk::ImageView],
-        extent: vk::Extent2D,
-    ) -> Result<Vec<vk::Framebuffer>> {
-        views
-            .iter()
-            .map(|&v| {
-                Ok(device.create_framebuffer(
-                    &vk::FramebufferCreateInfo::default()
-                        .render_pass(render_pass)
-                        .attachments(&[v])
-                        .width(extent.width)
-                        .height(extent.height)
-                        .layers(1),
-                    None,
-                )?)
-            })
-            .collect()
-    }
-
     unsafe fn create_pipeline(
         device: &Device,
-        render_pass: vk::RenderPass,
+        format: vk::Format,
         layout: vk::PipelineLayout,
         extent: vk::Extent2D,
     ) -> Result<vk::Pipeline> {
@@ -536,10 +524,16 @@ impl VkCtx {
                 .module(f_mod)
                 .name(cstr(b"main\0")),
         ];
+
+        let color_formats = [format];
+        let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats);
+
         let pipeline = device
             .create_graphics_pipelines(
                 vk::PipelineCache::null(),
                 &[vk::GraphicsPipelineCreateInfo::default()
+                    .push_next(&mut rendering_info)
                     .stages(&stages)
                     .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
                     .input_assembly_state(
@@ -585,9 +579,7 @@ impl VkCtx {
                                 .alpha_blend_op(vk::BlendOp::ADD),
                         ]),
                     )
-                    .layout(layout)
-                    .render_pass(render_pass)
-                    .subpass(0)],
+                    .layout(layout)],
                 None,
             )
             .map_err(|e| e.1)?[0];
@@ -596,37 +588,55 @@ impl VkCtx {
         Ok(pipeline)
     }
 
-    unsafe fn prepare_texture(&mut self, path: &PathBuf) -> Result<(u32, u32)> {
+    unsafe fn check_cache(&mut self, path: &Path) -> Option<(u32, u32)> {
         if let Some(tex) = self.cache.get(path) {
             if let Some(pos) = self.cache_order.iter().position(|p| p == path) {
                 self.cache_order.remove(pos);
             }
-            self.cache_order.push_back(path.clone());
+            self.cache_order.push_back(path.to_path_buf());
             self.update_descriptors(tex.view);
-            return Ok(tex.dims);
+            return Some(tex.dims);
         }
-        let img = image::open(path)?;
-        let dims = img.dimensions();
-        let rgba = img.to_rgba8();
+        None
+    }
+
+    unsafe fn upload_texture(
+        &mut self,
+        path: PathBuf,
+        rgba: image::RgbaImage,
+        dims: (u32, u32),
+    ) -> Result<()> {
         let px = rgba.into_raw();
-        self.device.queue_wait_idle(self.queue)?;
-        self.device.destroy_buffer(self.staging_buf, None);
-        self.device.free_memory(self.staging_mem, None);
-        let (s_buf, s_mem) = Self::create_buffer(
-            &self.instance,
-            &self.device,
-            self.pdev,
-            px.len() as u64,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        let size = px.len() as u64;
+
+        if size > self.staging_capacity {
+            let (new_buf, new_mem) = Self::create_buffer(
+                &self.instance,
+                &self.device,
+                self.pdev,
+                size,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            
+            self.device.queue_wait_idle(self.queue)?;
+            self.device.destroy_buffer(self.staging_buf, None);
+            self.device.free_memory(self.staging_mem, None);
+            
+            self.staging_buf = new_buf;
+            self.staging_mem = new_mem;
+            self.staging_capacity = size;
+        }
+
+        let ptr = self.device.map_memory(
+            self.staging_mem,
+            0,
+            size,
+            vk::MemoryMapFlags::empty(),
         )?;
-        let ptr = self
-            .device
-            .map_memory(s_mem, 0, px.len() as u64, vk::MemoryMapFlags::empty())?;
         std::ptr::copy_nonoverlapping(px.as_ptr(), ptr as *mut u8, px.len());
-        self.device.unmap_memory(s_mem);
-        self.staging_buf = s_buf;
-        self.staging_mem = s_mem;
+        self.device.unmap_memory(self.staging_mem);
+
         let tex_image = self.device.create_image(
             &vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
@@ -644,8 +654,9 @@ impl VkCtx {
                 .initial_layout(vk::ImageLayout::UNDEFINED),
             None,
         )?;
+
         let req = self.device.get_image_memory_requirements(tex_image);
-        let tex_mem = self.device.allocate_memory(
+        let tex_mem_result = self.device.allocate_memory(
             &vk::MemoryAllocateInfo::default()
                 .allocation_size(req.size)
                 .memory_type_index(Self::find_memory_type(
@@ -655,9 +666,31 @@ impl VkCtx {
                     vk::MemoryPropertyFlags::DEVICE_LOCAL,
                 )?),
             None,
-        )?;
-        self.device.bind_image_memory(tex_image, tex_mem, 0)?;
-        let cmd = Self::one_shot_begin(&self.device, self.cmd_pool)?;
+        );
+
+        let tex_mem = match tex_mem_result {
+            Ok(m) => m,
+            Err(e) => {
+                self.device.destroy_image(tex_image, None);
+                return Err(e.into());
+            }
+        };
+
+        if let Err(e) = self.device.bind_image_memory(tex_image, tex_mem, 0) {
+            self.device.free_memory(tex_mem, None);
+            self.device.destroy_image(tex_image, None);
+            return Err(e.into());
+        }
+
+        let cmd = match Self::one_shot_begin(&self.device, self.cmd_pool) {
+            Ok(c) => c,
+            Err(e) => {
+                self.device.free_memory(tex_mem, None);
+                self.device.destroy_image(tex_image, None);
+                return Err(e);
+            }
+        };
+
         Self::transition_image(
             &self.device,
             cmd,
@@ -671,7 +704,7 @@ impl VkCtx {
         );
         self.device.cmd_copy_buffer_to_image(
             cmd,
-            s_buf,
+            self.staging_buf,
             tex_image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             &[vk::BufferImageCopy {
@@ -700,8 +733,14 @@ impl VkCtx {
             vk::AccessFlags::TRANSFER_WRITE,
             vk::AccessFlags::SHADER_READ,
         );
-        Self::one_shot_end(&self.device, self.cmd_pool, self.queue, cmd)?;
-        let tex_view = self.device.create_image_view(
+
+        if let Err(e) = Self::one_shot_end(&self.device, self.cmd_pool, self.queue, cmd) {
+            self.device.free_memory(tex_mem, None);
+            self.device.destroy_image(tex_image, None);
+            return Err(e);
+        }
+
+        let tex_view_result = self.device.create_image_view(
             &vk::ImageViewCreateInfo::default()
                 .image(tex_image)
                 .view_type(vk::ImageViewType::TYPE_2D)
@@ -714,7 +753,17 @@ impl VkCtx {
                     layer_count: 1,
                 }),
             None,
-        )?;
+        );
+
+        let tex_view = match tex_view_result {
+            Ok(v) => v,
+            Err(e) => {
+                self.device.free_memory(tex_mem, None);
+                self.device.destroy_image(tex_image, None);
+                return Err(e.into());
+            }
+        };
+
         self.update_descriptors(tex_view);
         if self.cache_order.len() >= self.max_cache_size {
             if let Some(old_path) = self.cache_order.pop_front() {
@@ -734,8 +783,8 @@ impl VkCtx {
                 dims,
             },
         );
-        self.cache_order.push_back(path.clone());
-        Ok(dims)
+        self.cache_order.push_back(path);
+        Ok(())
     }
 
     unsafe fn update_descriptors(&self, view: vk::ImageView) {
@@ -761,9 +810,6 @@ impl VkCtx {
         for &v in &self.sc_views {
             self.device.destroy_image_view(v, None);
         }
-        for &f in &self.framebuffers {
-            self.device.destroy_framebuffer(f, None);
-        }
         self.swapchain_loader
             .destroy_swapchain(self.swapchain, None);
         let (sc, imgs, views, fmt, ext) = Self::create_swapchain_resources(
@@ -780,24 +826,58 @@ impl VkCtx {
         self.sc_views = views;
         self.sc_format = fmt;
         self.extent = ext;
-        self.framebuffers =
-            Self::create_framebuffers(&self.device, self.render_pass, &self.sc_views, self.extent)?;
+
+        self.device
+            .destroy_descriptor_pool(self.descriptor_pool, None);
+        self.descriptor_pool = self.device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .pool_sizes(&[vk::DescriptorPoolSize {
+                    ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    descriptor_count: self.sc_images.len() as u32,
+                }])
+                .max_sets(self.sc_images.len() as u32),
+            None,
+        )?;
+        self.descriptor_sets = self.device.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.descriptor_pool)
+                .set_layouts(&vec![self.descriptor_layout; self.sc_images.len()]),
+        )?;
+
+        self.device.free_command_buffers(self.cmd_pool, &self.cmd_bufs);
+        self.cmd_bufs = self.device.allocate_command_buffers(
+            &vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.cmd_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(self.sc_images.len() as u32),
+        )?;
+
         self.device.destroy_pipeline(self.pipeline, None);
         self.pipeline = Self::create_pipeline(
             &self.device,
-            self.render_pass,
+            self.sc_format,
             self.pipeline_layout,
             self.extent,
         )?;
+
+        if let Some(path) = self.cache_order.back().cloned() {
+            if let Some(tex) = self.cache.get(&path) {
+                self.update_descriptors(tex.view);
+            }
+        }
+
         Ok(())
     }
 
-    unsafe fn draw(&self, pc: PushConst, bg: [f32; 4]) -> Result<()> {
-        self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+    unsafe fn draw(&mut self, pc: PushConst, bg: [f32; 4]) -> Result<()> {
+        let frame_idx = self.current_frame;
+        self.device
+            .wait_for_fences(&[self.fences[frame_idx]], true, u64::MAX)?;
+
         let result = self.swapchain_loader.acquire_next_image(
             self.swapchain,
             u64::MAX,
-            self.image_available,
+            self.image_available[frame_idx],
             vk::Fence::null(),
         );
         let idx = match result {
@@ -805,26 +885,45 @@ impl VkCtx {
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return Ok(()),
             Err(e) => bail!("Vulkan error: {:?}", e),
         };
-        self.device.reset_fences(&[self.fence])?;
+
+        self.device.reset_fences(&[self.fences[frame_idx]])?;
         let cmd = self.cmd_bufs[idx as usize];
         self.device
             .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
         self.device
             .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
-        self.device.cmd_begin_render_pass(
+
+        Self::transition_image(
+            &self.device,
             cmd,
-            &vk::RenderPassBeginInfo::default()
-                .render_pass(self.render_pass)
-                .framebuffer(self.framebuffers[idx as usize])
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: self.extent,
-                })
-                .clear_values(&[vk::ClearValue {
-                    color: vk::ClearColorValue { float32: bg },
-                }]),
-            vk::SubpassContents::INLINE,
+            self.sc_images[idx as usize],
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags::empty(),
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
         );
+
+        let color_attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(self.sc_views[idx as usize])
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(vk::ClearValue {
+                color: vk::ClearColorValue { float32: bg },
+            });
+
+        let color_attachments = [color_attachment];
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D::default(),
+                extent: self.extent,
+            })
+            .layer_count(1)
+            .color_attachments(&color_attachments);
+
+        self.device.cmd_begin_rendering(cmd, &rendering_info);
         self.device
             .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
         self.device.cmd_bind_descriptor_sets(
@@ -843,24 +942,39 @@ impl VkCtx {
             bytemuck::bytes_of(&pc),
         );
         self.device.cmd_draw(cmd, 4, 1, 0, 0);
-        self.device.cmd_end_render_pass(cmd);
+        self.device.cmd_end_rendering(cmd);
+
+        Self::transition_image(
+            &self.device,
+            cmd,
+            self.sc_images[idx as usize],
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::AccessFlags::empty(),
+        );
+
         self.device.end_command_buffer(cmd)?;
         self.device.queue_submit(
             self.queue,
             &[vk::SubmitInfo::default()
-                .wait_semaphores(&[self.image_available])
+                .wait_semaphores(&[self.image_available[frame_idx]])
                 .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
                 .command_buffers(&[cmd])
-                .signal_semaphores(&[self.render_done])],
-            self.fence,
+                .signal_semaphores(&[self.render_done[frame_idx]])],
+            self.fences[frame_idx],
         )?;
         let _ = self.swapchain_loader.queue_present(
             self.queue,
             &vk::PresentInfoKHR::default()
-                .wait_semaphores(&[self.render_done])
+                .wait_semaphores(&[self.render_done[frame_idx]])
                 .swapchains(&[self.swapchain])
                 .image_indices(&[idx]),
         );
+
+        self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
         Ok(())
     }
 }
@@ -874,17 +988,15 @@ impl Drop for VkCtx {
                 self.device.destroy_image(tex.image, None);
                 self.device.free_memory(tex.mem, None);
             }
-            self.device.destroy_semaphore(self.image_available, None);
-            self.device.destroy_semaphore(self.render_done, None);
-            self.device.destroy_fence(self.fence, None);
-            self.device.destroy_command_pool(self.cmd_pool, None);
-            for &f in &self.framebuffers {
-                self.device.destroy_framebuffer(f, None);
+            for i in 0..MAX_FRAMES_IN_FLIGHT {
+                self.device.destroy_semaphore(self.image_available[i], None);
+                self.device.destroy_semaphore(self.render_done[i], None);
+                self.device.destroy_fence(self.fences[i], None);
             }
+            self.device.destroy_command_pool(self.cmd_pool, None);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
-            self.device.destroy_render_pass(self.render_pass, None);
             for &v in &self.sc_views {
                 self.device.destroy_image_view(v, None);
             }
@@ -1107,6 +1219,32 @@ fn main() -> Result<()> {
         window.set_fullscreen(Some(Fullscreen::Borderless(None)));
     }
     let mut vk = unsafe { VkCtx::new(&window)? };
+
+    let load_version = Arc::new(AtomicUsize::new(0));
+    let (tx_load, rx_load) = mpsc::channel::<(PathBuf, usize)>();
+    let (tx_done, rx_done) = mpsc::channel::<Result<(PathBuf, image::RgbaImage, (u32, u32), usize), (PathBuf, String, usize)>>();
+    
+    let worker_version = Arc::clone(&load_version);
+    let worker_window = Arc::clone(&window);
+    thread::spawn(move || {
+        while let Ok((path, version)) = rx_load.recv() {
+            if version < worker_version.load(Ordering::Relaxed) {
+                continue;
+            }
+            match image::open(&path) {
+                Ok(img) => {
+                    let dims = img.dimensions();
+                    let rgba = img.to_rgba8();
+                    let _ = tx_done.send(Ok((path, rgba, dims, version)));
+                }
+                Err(e) => {
+                    let _ = tx_done.send(Err((path, e.to_string(), version)));
+                }
+            }
+            worker_window.request_redraw();
+        }
+    });
+
     let (mut zoom, mut offset, mut last_load, mut needs_up, mut dims, mut modifiers) = (
         1.0f32,
         [0.0f32, 0.0f32],
@@ -1118,6 +1256,32 @@ fn main() -> Result<()> {
     window.request_redraw();
     event_loop
         .run(move |event, elwt| {
+            while let Ok(res) = rx_done.try_recv() {
+                match res {
+                    Ok((path, rgba, d, version)) => {
+                        if version == load_version.load(Ordering::Relaxed) {
+                            if let Err(e) = unsafe { vk.upload_texture(path, rgba, d) } {
+                                eprintln!("Upload error: {:?}", e);
+                                window.set_title(&format!("rviv - [Error] {}", images[current_idx].display()));
+                            } else {
+                                dims = d;
+                                window.set_title(&format!("rviv - {}", images[current_idx].display()));
+                                let (ww, wh) = (vk.extent.width as f32, vk.extent.height as f32);
+                                zoom = (ww / dims.0 as f32).min(wh / dims.1 as f32).min(1.0);
+                                offset = [0.0, 0.0];
+                            }
+                            window.request_redraw();
+                        }
+                    }
+                    Err((path, err, version)) => {
+                        if version == load_version.load(Ordering::Relaxed) {
+                            eprintln!("Failed to load {}: {}", path.display(), err);
+                            window.set_title(&format!("rviv - [Error] {}", path.display()));
+                        }
+                    }
+                }
+            }
+
             elwt.set_control_flow(if cli.slideshow > 0.0 {
                 ControlFlow::WaitUntil(Instant::now() + Duration::from_secs_f32(cli.slideshow))
             } else {
@@ -1138,19 +1302,19 @@ fn main() -> Result<()> {
                     WindowEvent::ModifiersChanged(m) => modifiers = m,
                     WindowEvent::RedrawRequested => {
                         if needs_up {
-                            match unsafe { vk.prepare_texture(&images[current_idx]) } {
-                                Ok(d) => {
-                                    dims = d;
-                                    needs_up = false;
-                                    window.set_title(&format!("rviv - {}", images[current_idx].display()));
-                                    let (ww, wh) = (vk.extent.width as f32, vk.extent.height as f32);
-                                    zoom = (ww / dims.0 as f32).min(wh / dims.1 as f32).min(1.0);
-                                    offset = [0.0, 0.0];
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to load {}: {:?}", images[current_idx].display(), e);
-                                    needs_up = false;
-                                }
+                            let path = &images[current_idx];
+                            if let Some(d) = unsafe { vk.check_cache(path) } {
+                                dims = d;
+                                needs_up = false;
+                                window.set_title(&format!("rviv - {}", path.display()));
+                                let (ww, wh) = (vk.extent.width as f32, vk.extent.height as f32);
+                                zoom = (ww / dims.0 as f32).min(wh / dims.1 as f32).min(1.0);
+                                offset = [0.0, 0.0];
+                            } else {
+                                let version = load_version.fetch_add(1, Ordering::Relaxed) + 1;
+                                let _ = tx_load.send((path.clone(), version));
+                                needs_up = false;
+                                window.set_title(&format!("rviv - [Loading] {}", path.display()));
                             }
                         }
                         let (ww, wh) = (vk.extent.width as f32, vk.extent.height as f32);
