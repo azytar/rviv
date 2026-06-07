@@ -1,0 +1,28 @@
+[package]
+name = "rviv"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rviv"
+path = "src/main.rs"
+
+[dependencies]
+image = { version = "0.25", features = ["png","jpeg","gif","bmp","tiff","webp","ico"] }
+ash = "0.38.0"
+ash-window = "0.13.0"
+winit = { version = "0.29", features = ["wayland","x11"] }
+raw-window-handle = "0.6"
+bytemuck = { version = "1", features = ["derive"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+glob = "0.3"
+walkdir = "2"
+x11rb = { version = "0.13", features = ["all-extensions", "image"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = true
+codegen-units = 1
