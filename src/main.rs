@@ -95,7 +95,7 @@ impl VkCtx {
         pdev: vk::PhysicalDevice,
         type_filter: u32,
         props: vk::MemoryPropertyFlags,
-    ) -> u32 {
+    ) -> Result<u32> {
         let mem_props = inst.get_physical_device_memory_properties(pdev);
         for i in 0..mem_props.memory_type_count {
             if (type_filter & (1 << i)) != 0
@@ -103,10 +103,10 @@ impl VkCtx {
                     .property_flags
                     .contains(props)
             {
-                return i;
+                return Ok(i);
             }
         }
-        panic!("Memory type not found");
+        bail!("Memory type not found")
     }
 
     unsafe fn create_buffer(
@@ -116,32 +116,28 @@ impl VkCtx {
         size: u64,
         usage: vk::BufferUsageFlags,
         props: vk::MemoryPropertyFlags,
-    ) -> (vk::Buffer, vk::DeviceMemory) {
-        let buf = device
-            .create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(size)
-                    .usage(usage)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            )
-            .unwrap();
+    ) -> Result<(vk::Buffer, vk::DeviceMemory)> {
+        let buf = device.create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE),
+            None,
+        )?;
         let req = device.get_buffer_memory_requirements(buf);
-        let mem = device
-            .allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(req.size)
-                    .memory_type_index(Self::find_memory_type(
-                        inst,
-                        pdev,
-                        req.memory_type_bits,
-                        props,
-                    )),
-                None,
-            )
-            .unwrap();
-        device.bind_buffer_memory(buf, mem, 0).unwrap();
-        (buf, mem)
+        let mem = device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(Self::find_memory_type(
+                    inst,
+                    pdev,
+                    req.memory_type_bits,
+                    props,
+                )?),
+            None,
+        )?;
+        device.bind_buffer_memory(buf, mem, 0)?;
+        Ok((buf, mem))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -181,23 +177,20 @@ impl VkCtx {
         );
     }
 
-    unsafe fn one_shot_begin(device: &Device, pool: vk::CommandPool) -> vk::CommandBuffer {
+    unsafe fn one_shot_begin(device: &Device, pool: vk::CommandPool) -> Result<vk::CommandBuffer> {
         let cmd = device
             .allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
                     .command_pool(pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
                     .command_buffer_count(1),
-            )
-            .unwrap()[0];
-        device
-            .begin_command_buffer(
-                cmd,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .unwrap();
-        cmd
+            )?[0];
+        device.begin_command_buffer(
+            cmd,
+            &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )?;
+        Ok(cmd)
     }
 
     unsafe fn one_shot_end(
@@ -205,17 +198,16 @@ impl VkCtx {
         pool: vk::CommandPool,
         queue: vk::Queue,
         cmd: vk::CommandBuffer,
-    ) {
-        device.end_command_buffer(cmd).unwrap();
-        device
-            .queue_submit(
-                queue,
-                &[vk::SubmitInfo::default().command_buffers(&[cmd])],
-                vk::Fence::null(),
-            )
-            .unwrap();
-        device.queue_wait_idle(queue).unwrap();
+    ) -> Result<()> {
+        device.end_command_buffer(cmd)?;
+        device.queue_submit(
+            queue,
+            &[vk::SubmitInfo::default().command_buffers(&[cmd])],
+            vk::Fence::null(),
+        )?;
+        device.queue_wait_idle(queue)?;
         device.free_command_buffers(pool, &[cmd]);
+        Ok(())
     }
 
     unsafe fn new(window: &winit::window::Window) -> Result<Self> {
@@ -347,7 +339,7 @@ impl VkCtx {
             4,
             vk::BufferUsageFlags::TRANSFER_SRC,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        );
+        )?;
         Ok(Self {
             _entry: entry,
             instance: inst,
@@ -404,7 +396,8 @@ impl VkCtx {
         let surf_fmt = formats
             .iter()
             .find(|f| f.format == vk::Format::B8G8R8A8_SRGB)
-            .unwrap_or(&formats[0]);
+            .context("B8G8R8A8_SRGB format not found")
+            .or_else(|_| formats.get(0).context("No surface formats found"))?;
         let extent = if caps.current_extent.width != u32::MAX {
             caps.current_extent
         } else {
@@ -520,14 +513,17 @@ impl VkCtx {
         let v_spv = include_bytes!("shaders/vert.spv");
         let f_spv = include_bytes!("shaders/frag.spv");
 
+        let v_code = ash::util::read_spv(&mut std::io::Cursor::new(v_spv))
+            .context("Failed to read vertex shader SPIR-V")?;
+        let f_code = ash::util::read_spv(&mut std::io::Cursor::new(f_spv))
+            .context("Failed to read fragment shader SPIR-V")?;
+
         let v_mod = device.create_shader_module(
-            &vk::ShaderModuleCreateInfo::default()
-                .code(bytemuck::cast_slice(v_spv)),
+            &vk::ShaderModuleCreateInfo::default().code(&v_code),
             None,
         )?;
         let f_mod = device.create_shader_module(
-            &vk::ShaderModuleCreateInfo::default()
-                .code(bytemuck::cast_slice(f_spv)),
+            &vk::ShaderModuleCreateInfo::default().code(&f_code),
             None,
         )?;
         let stages = [
@@ -623,7 +619,7 @@ impl VkCtx {
             px.len() as u64,
             vk::BufferUsageFlags::TRANSFER_SRC,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        );
+        )?;
         let ptr = self
             .device
             .map_memory(s_mem, 0, px.len() as u64, vk::MemoryMapFlags::empty())?;
@@ -657,11 +653,11 @@ impl VkCtx {
                     self.pdev,
                     req.memory_type_bits,
                     vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                )),
+                )?),
             None,
         )?;
         self.device.bind_image_memory(tex_image, tex_mem, 0)?;
-        let cmd = Self::one_shot_begin(&self.device, self.cmd_pool);
+        let cmd = Self::one_shot_begin(&self.device, self.cmd_pool)?;
         Self::transition_image(
             &self.device,
             cmd,
@@ -704,7 +700,7 @@ impl VkCtx {
             vk::AccessFlags::TRANSFER_WRITE,
             vk::AccessFlags::SHADER_READ,
         );
-        Self::one_shot_end(&self.device, self.cmd_pool, self.queue, cmd);
+        Self::one_shot_end(&self.device, self.cmd_pool, self.queue, cmd)?;
         let tex_view = self.device.create_image_view(
             &vk::ImageViewCreateInfo::default()
                 .image(tex_image)
@@ -1130,23 +1126,37 @@ fn main() -> Result<()> {
             match event {
                 Event::WindowEvent { event, .. } => match event {
                     WindowEvent::CloseRequested => elwt.exit(),
-                    WindowEvent::Resized(s) => unsafe {
-                        vk.recreate_swapchain(s.width, s.height).unwrap();
-                    },
+                    WindowEvent::Resized(s) => {
+                        if s.width > 0 && s.height > 0 {
+                            unsafe {
+                                if let Err(e) = vk.recreate_swapchain(s.width, s.height) {
+                                    eprintln!("Swapchain error: {:?}", e);
+                                }
+                            }
+                        }
+                    }
                     WindowEvent::ModifiersChanged(m) => modifiers = m,
                     WindowEvent::RedrawRequested => {
                         if needs_up {
-                            dims = unsafe { vk.prepare_texture(&images[current_idx]).unwrap() };
-                            needs_up = false;
-                            window.set_title(&format!("rviv - {}", images[current_idx].display()));
-                            let (ww, wh) = (vk.extent.width as f32, vk.extent.height as f32);
-                            zoom = (ww / dims.0 as f32).min(wh / dims.1 as f32).min(1.0);
-                            offset = [0.0, 0.0];
+                            match unsafe { vk.prepare_texture(&images[current_idx]) } {
+                                Ok(d) => {
+                                    dims = d;
+                                    needs_up = false;
+                                    window.set_title(&format!("rviv - {}", images[current_idx].display()));
+                                    let (ww, wh) = (vk.extent.width as f32, vk.extent.height as f32);
+                                    zoom = (ww / dims.0 as f32).min(wh / dims.1 as f32).min(1.0);
+                                    offset = [0.0, 0.0];
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to load {}: {:?}", images[current_idx].display(), e);
+                                    needs_up = false;
+                                }
+                            }
                         }
                         let (ww, wh) = (vk.extent.width as f32, vk.extent.height as f32);
                         let (sx, sy) = ((ww / dims.0 as f32) / zoom, (wh / dims.1 as f32) / zoom);
                         unsafe {
-                            vk.draw(
+                            if let Err(e) = vk.draw(
                                 PushConst {
                                     offset: [
                                         0.5 * (1.0 - sx) - offset[0] * sx,
@@ -1155,8 +1165,12 @@ fn main() -> Result<()> {
                                     scale: [sx, sy],
                                 },
                                 [0.05, 0.05, 0.05, 1.0],
-                            )
-                            .unwrap();
+                            ) {
+                                if e.to_string().contains("OUT_OF_DATE") {
+                                } else {
+                                    eprintln!("Draw error: {:?}", e);
+                                }
+                            }
                         }
                     }
                     WindowEvent::KeyboardInput {
@@ -1269,7 +1283,6 @@ fn main() -> Result<()> {
                 }
                 _ => (),
             }
-        })
-        .unwrap();
+        })?;
     Ok(())
 }
